@@ -421,13 +421,13 @@ jobs:
           path: ./*
           key: ${{ github.sha }}-${{ github.run_number }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4.1.7
         with:
           pattern: next-swc-binaries-*
           merge-multiple: true
           path: packages/next-swc/native
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4.1.7
         with:
           pattern: wasm-binaries-*
           merge-multiple: true
@@ -469,13 +469,13 @@ jobs:
           path: ./*
           key: ${{ github.sha }}-${{ github.run_number }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4.1.7
         with:
           pattern: next-swc-binaries-*
           merge-multiple: true
           path: packages/next-swc/native
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4.1.7
         with:
           pattern: wasm-binaries-*
           merge-multiple: true
@@ -532,7 +532,7 @@ jobs:
         with:
           fetch-depth: 25
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4.1.7
         with:
           pattern: next-swc-binaries
           merge-multiple: true
@@ -554,7 +554,7 @@ jobs:
       DATADOG_API_KEY: ${{ secrets.DATA_DOG_API_KEY }}
     steps:
       - name: Collect bytesize metrics
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.1.7
         with:
           pattern: turbopack-bytesize-*
           merge-multiple: true
