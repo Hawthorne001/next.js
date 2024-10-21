@@ -5,6 +5,7 @@ import {
   TRACE_IGNORES,
   type BuildTraceContext,
   getFilesMapFromReasons,
+  getHash,
 } from './webpack/plugins/next-trace-entrypoints-plugin'
 
 import {
@@ -16,7 +17,7 @@ import path from 'path'
 import fs from 'fs/promises'
 import { loadBindings } from './swc'
 import { nonNullable } from '../lib/non-nullable'
-import * as ciEnvironment from '../telemetry/ci-info'
+import * as ciEnvironment from '../server/ci-info'
 import debugOriginal from 'next/dist/compiled/debug'
 import picomatch from 'next/dist/compiled/picomatch'
 import { defaultOverrides } from '../server/require-hook'
@@ -26,8 +27,11 @@ import { normalizeAppPath } from '../shared/lib/router/utils/app-paths'
 import isError from '../lib/is-error'
 import type { NodeFileTraceReasons } from '@vercel/nft'
 import type { RoutesUsingEdgeRuntime } from './utils'
+import type { ExternalObject, NextTurboTasks } from './swc/generated-native'
 
 const debug = debugOriginal('next:build:build-traces')
+
+const hashCache: Record<string, string> = {}
 
 function shouldIgnore(
   file: string,
@@ -88,11 +92,13 @@ export async function collectBuildTraces({
   hasSsrAmpPages,
   buildTraceContext,
   outputFileTracingRoot,
+  isFlyingShuttle,
 }: {
   dir: string
   distDir: string
   staticPages: string[]
   hasSsrAmpPages: boolean
+  isFlyingShuttle?: boolean
   outputFileTracingRoot: string
   // pageInfos is serialized when this function runs in a worker.
   edgeRuntimeRoutes: RoutesUsingEdgeRuntime
@@ -102,7 +108,7 @@ export async function collectBuildTraces({
 }) {
   const startTime = Date.now()
   debug('starting build traces')
-  let turboTasksForTrace: unknown
+  let turboTasksForTrace: ExternalObject<NextTurboTasks>
   let bindings = await loadBindings()
 
   const runTurbotrace = async function () {
@@ -113,6 +119,8 @@ export async function collectBuildTraces({
       let turbotraceOutputPath: string | undefined
       let turbotraceFiles: string[] | undefined
       turboTasksForTrace = bindings.turbo.createTurboTasks(
+        distDir,
+        false,
         (config.experimental.turbotrace?.memoryLimit ??
           TURBO_TRACE_DEFAULT_MEMORY_LIMIT) *
           1024 *
@@ -200,7 +208,7 @@ export async function collectBuildTraces({
   }
 
   const { outputFileTracingIncludes = {}, outputFileTracingExcludes = {} } =
-    config.experimental
+    config
   const excludeGlobKeys = Object.keys(outputFileTracingExcludes)
   const includeGlobKeys = Object.keys(outputFileTracingIncludes)
 
@@ -236,6 +244,7 @@ export async function collectBuildTraces({
       ]
 
       const { cacheHandler } = config
+      const { cacheHandlers } = config.experimental
 
       // ensure we trace any dependencies needed for custom
       // incremental cache handler
@@ -247,6 +256,20 @@ export async function collectBuildTraces({
               : path.join(dir, cacheHandler)
           )
         )
+      }
+
+      if (cacheHandlers) {
+        for (const handlerPath of Object.values(cacheHandlers)) {
+          if (handlerPath) {
+            sharedEntriesSet.push(
+              require.resolve(
+                path.isAbsolute(handlerPath)
+                  ? handlerPath
+                  : path.join(dir, handlerPath)
+              )
+            )
+          }
+        }
       }
 
       const serverEntries = [
@@ -305,7 +328,6 @@ export async function collectBuildTraces({
               // only ignore image-optimizer code when
               // this is being handled outside of next-server
               '**/next/dist/server/image-optimizer.js',
-              '**/next/dist/server/lib/squoosh/**/*.wasm',
             ]
           : []),
 
@@ -315,7 +337,6 @@ export async function collectBuildTraces({
 
         ...(isStandalone ? [] : TRACE_IGNORES),
         ...additionalIgnores,
-        ...(config.experimental.outputFileTracingIgnores || []),
       ]
 
       const sharedIgnoresFn = makeIgnoreFn(sharedIgnores)
@@ -497,9 +518,11 @@ export async function collectBuildTraces({
           [minimalServerEntries, minimalServerTracedFiles],
         ] as Array<[string[], Set<string>]>) {
           for (const file of entries) {
-            const curFiles = parentFilesMap.get(
-              path.relative(outputFileTracingRoot, file)
-            )
+            const curFiles = [
+              ...(parentFilesMap
+                .get(path.relative(outputFileTracingRoot, file))
+                ?.keys() || []),
+            ]
             tracedFiles.add(path.relative(distDir, file).replace(/\\/g, '/'))
 
             for (const curFile of curFiles || []) {
@@ -546,8 +569,10 @@ export async function collectBuildTraces({
             }
 
             // we don't need to trace for automatically statically optimized
-            // pages as they don't have server bundles
-            if (staticPages.includes(route)) {
+            // pages as they don't have server bundles, note there is
+            // the caveat with flying shuttle mode as it needs this for
+            // detecting changed entries
+            if (staticPages.includes(route) && !isFlyingShuttle) {
               return
             }
             const entryOutputPath = path.join(
@@ -558,14 +583,22 @@ export async function collectBuildTraces({
             const traceOutputPath = `${entryOutputPath}.nft.json`
             const existingTrace = JSON.parse(
               await fs.readFile(traceOutputPath, 'utf8')
-            )
+            ) as {
+              version: number
+              files: string[]
+              fileHashes: Record<string, string>
+            }
             const traceOutputDir = path.dirname(traceOutputPath)
             const curTracedFiles = new Set<string>()
+            const curFileHashes: Record<string, string> =
+              existingTrace.fileHashes
 
             for (const file of [...entryNameFiles, entryOutputPath]) {
-              const curFiles = parentFilesMap.get(
-                path.relative(outputFileTracingRoot, file)
-              )
+              const curFiles = [
+                ...(parentFilesMap
+                  .get(path.relative(outputFileTracingRoot, file))
+                  ?.keys() || []),
+              ]
               for (const curFile of curFiles || []) {
                 if (
                   !shouldIgnore(
@@ -580,6 +613,19 @@ export async function collectBuildTraces({
                     .relative(traceOutputDir, filePath)
                     .replace(/\\/g, '/')
                   curTracedFiles.add(outputFile)
+
+                  if (isFlyingShuttle) {
+                    try {
+                      let hash = hashCache[filePath]
+
+                      if (!hash) {
+                        hash = getHash(await fs.readFile(filePath))
+                      }
+                      curFileHashes[outputFile] = hash
+                    } catch (err: any) {
+                      // handle symlink errors or similar
+                    }
+                  }
                 }
               }
             }
@@ -593,6 +639,11 @@ export async function collectBuildTraces({
               JSON.stringify({
                 ...existingTrace,
                 files: [...curTracedFiles].sort(),
+                ...(isFlyingShuttle
+                  ? {
+                      fileHashes: curFileHashes,
+                    }
+                  : {}),
               })
             )
           })
@@ -603,7 +654,7 @@ export async function collectBuildTraces({
 
       for (const type of moduleTypes) {
         const modulePath = require.resolve(
-          `next/dist/server/future/route-modules/${type}/module.compiled`
+          `next/dist/server/route-modules/${type}/module.compiled`
         )
         const relativeModulePath = path.relative(root, modulePath)
 
